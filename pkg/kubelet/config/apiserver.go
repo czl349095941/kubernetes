@@ -1,5 +1,5 @@
 /*
-Copyright 2015 Google Inc. All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,45 +18,32 @@ limitations under the License.
 package config
 
 import (
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/client"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/client/cache"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/kubelet"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/labels"
-	"github.com/golang/glog"
+	"k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
+	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/cache"
+	api "k8s.io/kubernetes/pkg/apis/core"
+	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
 )
 
 // NewSourceApiserver creates a config source that watches and pulls from the apiserver.
-func NewSourceApiserver(client *client.Client, hostname string, updates chan<- interface{}) {
-	lw := cache.NewListWatchFromClient(client, "pods", api.NamespaceAll, labels.OneTermEqualSelector(getHostFieldLabel(client.APIVersion()), hostname))
+func NewSourceApiserver(c clientset.Interface, nodeName types.NodeName, updates chan<- interface{}) {
+	lw := cache.NewListWatchFromClient(c.CoreV1().RESTClient(), "pods", metav1.NamespaceAll, fields.OneTermEqualSelector(api.PodHostField, string(nodeName)))
 	newSourceApiserverFromLW(lw, updates)
 }
 
-// newSourceApiserverFromLW holds creates a config source that watches an pulls from the apiserver.
+// newSourceApiserverFromLW holds creates a config source that watches and pulls from the apiserver.
 func newSourceApiserverFromLW(lw cache.ListerWatcher, updates chan<- interface{}) {
 	send := func(objs []interface{}) {
-		var bpods []api.BoundPod
+		var pods []*v1.Pod
 		for _, o := range objs {
-			pod := o.(*api.Pod)
-			bpod := api.BoundPod{}
-			if err := api.Scheme.Convert(pod, &bpod); err != nil {
-				glog.Errorf("Unable to interpret Pod from apiserver as a BoundPod: %v: %+v", err, pod)
-				continue
-			}
-			// Make a dummy self link so that references to this bound pod will work.
-			bpod.SelfLink = "/api/v1beta1/boundPods/" + bpod.Name
-			bpods = append(bpods, bpod)
+			pods = append(pods, o.(*v1.Pod))
 		}
-		updates <- kubelet.PodUpdate{bpods, kubelet.SET, kubelet.ApiserverSource}
+		updates <- kubetypes.PodUpdate{Pods: pods, Op: kubetypes.SET, Source: kubetypes.ApiserverSource}
 	}
-	cache.NewReflector(lw, &api.Pod{}, cache.NewUndeltaStore(send, cache.MetaNamespaceKeyFunc), 0).Run()
-}
-
-func getHostFieldLabel(apiVersion string) string {
-	switch apiVersion {
-	case "v1beta1", "v1beta2":
-		return "DesiredState.Host"
-	default:
-		return "spec.host"
-	}
+	r := cache.NewReflector(lw, &v1.Pod{}, cache.NewUndeltaStore(send, cache.MetaNamespaceKeyFunc), 0)
+	go r.Run(wait.NeverStop)
 }

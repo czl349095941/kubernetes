@@ -1,5 +1,5 @@
 /*
-Copyright 2014 Google Inc. All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,55 +19,45 @@ package config
 import (
 	"testing"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/client/cache"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/kubelet"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/runtime"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/watch"
+	"k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/tools/cache"
+	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
 )
-
-const hostname string = "mcaa1"
 
 type fakePodLW struct {
 	listResp  runtime.Object
 	watchResp watch.Interface
 }
 
-func (lw fakePodLW) List() (runtime.Object, error) {
+func (lw fakePodLW) List(options metav1.ListOptions) (runtime.Object, error) {
 	return lw.listResp, nil
 }
 
-func (lw fakePodLW) Watch(resourceVersion string) (watch.Interface, error) {
+func (lw fakePodLW) Watch(options metav1.ListOptions) (watch.Interface, error) {
 	return lw.watchResp, nil
 }
 
 var _ cache.ListerWatcher = fakePodLW{}
 
 func TestNewSourceApiserver_UpdatesAndMultiplePods(t *testing.T) {
-	pod1v1 := api.Pod{
-		ObjectMeta: api.ObjectMeta{Name: "p"},
-		Spec:       api.PodSpec{Containers: []api.Container{{Image: "image/one"}}}}
-	pod1v2 := api.Pod{
-		ObjectMeta: api.ObjectMeta{Name: "p"},
-		Spec:       api.PodSpec{Containers: []api.Container{{Image: "image/two"}}}}
-	pod2 := api.Pod{
-		ObjectMeta: api.ObjectMeta{Name: "q"},
-		Spec:       api.PodSpec{Containers: []api.Container{{Image: "image/blah"}}}}
-
-	expectedBoundPod1v1 := api.BoundPod{
-		ObjectMeta: api.ObjectMeta{Name: "p", SelfLink: "/api/v1beta1/boundPods/p"},
-		Spec:       api.PodSpec{Containers: []api.Container{{Image: "image/one"}}}}
-	expectedBoundPod1v2 := api.BoundPod{
-		ObjectMeta: api.ObjectMeta{Name: "p", SelfLink: "/api/v1beta1/boundPods/p"},
-		Spec:       api.PodSpec{Containers: []api.Container{{Image: "image/two"}}}}
-	expectedBoundPod2 := api.BoundPod{
-		ObjectMeta: api.ObjectMeta{Name: "q", SelfLink: "/api/v1beta1/boundPods/q"},
-		Spec:       api.PodSpec{Containers: []api.Container{{Image: "image/blah"}}}}
+	pod1v1 := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "p"},
+		Spec:       v1.PodSpec{Containers: []v1.Container{{Image: "image/one"}}}}
+	pod1v2 := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "p"},
+		Spec:       v1.PodSpec{Containers: []v1.Container{{Image: "image/two"}}}}
+	pod2 := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "q"},
+		Spec:       v1.PodSpec{Containers: []v1.Container{{Image: "image/blah"}}}}
 
 	// Setup fake api client.
 	fakeWatch := watch.NewFake()
 	lw := fakePodLW{
-		listResp:  &api.PodList{Items: []api.Pod{pod1v1}},
+		listResp:  &v1.PodList{Items: []v1.Pod{*pod1v1}},
 		watchResp: fakeWatch,
 	}
 
@@ -79,78 +69,78 @@ func TestNewSourceApiserver_UpdatesAndMultiplePods(t *testing.T) {
 	if !ok {
 		t.Errorf("Unable to read from channel when expected")
 	}
-	update := got.(kubelet.PodUpdate)
-	expected := CreatePodUpdate(kubelet.SET, kubelet.ApiserverSource, expectedBoundPod1v1)
-	if !api.Semantic.DeepEqual(expected, update) {
+	update := got.(kubetypes.PodUpdate)
+	expected := CreatePodUpdate(kubetypes.SET, kubetypes.ApiserverSource, pod1v1)
+	if !apiequality.Semantic.DeepEqual(expected, update) {
 		t.Errorf("Expected %#v; Got %#v", expected, update)
 	}
 
 	// Add another pod
-	fakeWatch.Add(&pod2)
+	fakeWatch.Add(pod2)
 	got, ok = <-ch
 	if !ok {
 		t.Errorf("Unable to read from channel when expected")
 	}
-	update = got.(kubelet.PodUpdate)
+	update = got.(kubetypes.PodUpdate)
 	// Could be sorted either of these two ways:
-	expectedA := CreatePodUpdate(kubelet.SET, kubelet.ApiserverSource, expectedBoundPod1v1, expectedBoundPod2)
-	expectedB := CreatePodUpdate(kubelet.SET, kubelet.ApiserverSource, expectedBoundPod2, expectedBoundPod1v1)
+	expectedA := CreatePodUpdate(kubetypes.SET, kubetypes.ApiserverSource, pod1v1, pod2)
+	expectedB := CreatePodUpdate(kubetypes.SET, kubetypes.ApiserverSource, pod2, pod1v1)
 
-	if !api.Semantic.DeepEqual(expectedA, update) && !api.Semantic.DeepEqual(expectedB, update) {
+	if !apiequality.Semantic.DeepEqual(expectedA, update) && !apiequality.Semantic.DeepEqual(expectedB, update) {
 		t.Errorf("Expected %#v or %#v, Got %#v", expectedA, expectedB, update)
 	}
 
 	// Modify pod1
-	fakeWatch.Modify(&pod1v2)
+	fakeWatch.Modify(pod1v2)
 	got, ok = <-ch
 	if !ok {
 		t.Errorf("Unable to read from channel when expected")
 	}
-	update = got.(kubelet.PodUpdate)
-	expectedA = CreatePodUpdate(kubelet.SET, kubelet.ApiserverSource, expectedBoundPod1v2, expectedBoundPod2)
-	expectedB = CreatePodUpdate(kubelet.SET, kubelet.ApiserverSource, expectedBoundPod2, expectedBoundPod1v2)
+	update = got.(kubetypes.PodUpdate)
+	expectedA = CreatePodUpdate(kubetypes.SET, kubetypes.ApiserverSource, pod1v2, pod2)
+	expectedB = CreatePodUpdate(kubetypes.SET, kubetypes.ApiserverSource, pod2, pod1v2)
 
-	if !api.Semantic.DeepEqual(expectedA, update) && !api.Semantic.DeepEqual(expectedB, update) {
+	if !apiequality.Semantic.DeepEqual(expectedA, update) && !apiequality.Semantic.DeepEqual(expectedB, update) {
 		t.Errorf("Expected %#v or %#v, Got %#v", expectedA, expectedB, update)
 	}
 
 	// Delete pod1
-	fakeWatch.Delete(&pod1v2)
+	fakeWatch.Delete(pod1v2)
 	got, ok = <-ch
 	if !ok {
 		t.Errorf("Unable to read from channel when expected")
 	}
-	update = got.(kubelet.PodUpdate)
-	expected = CreatePodUpdate(kubelet.SET, kubelet.ApiserverSource, expectedBoundPod2)
-	if !api.Semantic.DeepEqual(expected, update) {
+	update = got.(kubetypes.PodUpdate)
+	expected = CreatePodUpdate(kubetypes.SET, kubetypes.ApiserverSource, pod2)
+	if !apiequality.Semantic.DeepEqual(expected, update) {
 		t.Errorf("Expected %#v, Got %#v", expected, update)
 	}
 
 	// Delete pod2
-	fakeWatch.Delete(&pod2)
+	fakeWatch.Delete(pod2)
 	got, ok = <-ch
 	if !ok {
 		t.Errorf("Unable to read from channel when expected")
 	}
-	update = got.(kubelet.PodUpdate)
-	expected = CreatePodUpdate(kubelet.SET, kubelet.ApiserverSource)
-	if !api.Semantic.DeepEqual(expected, update) {
+	update = got.(kubetypes.PodUpdate)
+	expected = CreatePodUpdate(kubetypes.SET, kubetypes.ApiserverSource)
+	if !apiequality.Semantic.DeepEqual(expected, update) {
 		t.Errorf("Expected %#v, Got %#v", expected, update)
 	}
 }
 
 func TestNewSourceApiserver_TwoNamespacesSameName(t *testing.T) {
-	pod1 := api.Pod{
-		ObjectMeta: api.ObjectMeta{Name: "p", Namespace: "one"},
-		Spec:       api.PodSpec{Containers: []api.Container{{Image: "image/one"}}}}
-	pod2 := api.Pod{
-		ObjectMeta: api.ObjectMeta{Name: "p", Namespace: "two"},
-		Spec:       api.PodSpec{Containers: []api.Container{{Image: "image/blah"}}}}
+	pod1 := v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "one"},
+		Spec:       v1.PodSpec{Containers: []v1.Container{{Image: "image/one"}}}}
+	pod2 := v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "two"},
+		Spec:       v1.PodSpec{Containers: []v1.Container{{Image: "image/blah"}}}}
 
 	// Setup fake api client.
 	fakeWatch := watch.NewFake()
 	lw := fakePodLW{
-		listResp:  &api.PodList{Items: []api.Pod{pod1, pod2}},
+		listResp:  &v1.PodList{Items: []v1.Pod{pod1, pod2}},
 		watchResp: fakeWatch,
 	}
 
@@ -162,7 +152,7 @@ func TestNewSourceApiserver_TwoNamespacesSameName(t *testing.T) {
 	if !ok {
 		t.Errorf("Unable to read from channel when expected")
 	}
-	update := got.(kubelet.PodUpdate)
+	update := got.(kubetypes.PodUpdate)
 	// Make sure that we get both pods.  Catches bug #2294.
 	if !(len(update.Pods) == 2) {
 		t.Errorf("Expected %d, Got %d", 2, len(update.Pods))
@@ -174,7 +164,7 @@ func TestNewSourceApiserver_TwoNamespacesSameName(t *testing.T) {
 	if !ok {
 		t.Errorf("Unable to read from channel when expected")
 	}
-	update = got.(kubelet.PodUpdate)
+	update = got.(kubetypes.PodUpdate)
 	if !(len(update.Pods) == 1) {
 		t.Errorf("Expected %d, Got %d", 1, len(update.Pods))
 	}
@@ -184,7 +174,7 @@ func TestNewSourceApiserverInitialEmptySendsEmptyPodUpdate(t *testing.T) {
 	// Setup fake api client.
 	fakeWatch := watch.NewFake()
 	lw := fakePodLW{
-		listResp:  &api.PodList{Items: []api.Pod{}},
+		listResp:  &v1.PodList{Items: []v1.Pod{}},
 		watchResp: fakeWatch,
 	}
 
@@ -196,9 +186,9 @@ func TestNewSourceApiserverInitialEmptySendsEmptyPodUpdate(t *testing.T) {
 	if !ok {
 		t.Errorf("Unable to read from channel when expected")
 	}
-	update := got.(kubelet.PodUpdate)
-	expected := CreatePodUpdate(kubelet.SET, kubelet.ApiserverSource)
-	if !api.Semantic.DeepEqual(expected, update) {
+	update := got.(kubetypes.PodUpdate)
+	expected := CreatePodUpdate(kubetypes.SET, kubetypes.ApiserverSource)
+	if !apiequality.Semantic.DeepEqual(expected, update) {
 		t.Errorf("Expected %#v; Got %#v", expected, update)
 	}
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2014 Google Inc. All rights reserved.
+Copyright 2016 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,8 +18,6 @@ limitations under the License.
 package config
 
 import (
-	"crypto/md5"
-	"encoding/hex"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -28,37 +26,99 @@ import (
 	"strings"
 	"time"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api/v1beta1"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/kubelet"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/types"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/util"
+	"k8s.io/klog"
 
-	"github.com/ghodss/yaml"
-	"github.com/golang/glog"
+	"k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/cache"
+	api "k8s.io/kubernetes/pkg/apis/core"
+	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
 )
 
-type sourceFile struct {
-	path    string
-	updates chan<- interface{}
+type podEventType int
+
+const (
+	podAdd podEventType = iota
+	podModify
+	podDelete
+
+	eventBufferLen = 10
+)
+
+type watchEvent struct {
+	fileName  string
+	eventType podEventType
 }
 
-func NewSourceFile(path string, period time.Duration, updates chan<- interface{}) {
-	config := &sourceFile{
-		path:    path,
-		updates: updates,
+type sourceFile struct {
+	path           string
+	nodeName       types.NodeName
+	period         time.Duration
+	store          cache.Store
+	fileKeyMapping map[string]string
+	updates        chan<- interface{}
+	watchEvents    chan *watchEvent
+}
+
+func NewSourceFile(path string, nodeName types.NodeName, period time.Duration, updates chan<- interface{}) {
+	// "github.com/sigma/go-inotify" requires a path without trailing "/"
+	path = strings.TrimRight(path, string(os.PathSeparator))
+
+	config := newSourceFile(path, nodeName, period, updates)
+	klog.V(1).Infof("Watching path %q", path)
+	config.run()
+}
+
+func newSourceFile(path string, nodeName types.NodeName, period time.Duration, updates chan<- interface{}) *sourceFile {
+	send := func(objs []interface{}) {
+		var pods []*v1.Pod
+		for _, o := range objs {
+			pods = append(pods, o.(*v1.Pod))
+		}
+		updates <- kubetypes.PodUpdate{Pods: pods, Op: kubetypes.SET, Source: kubetypes.FileSource}
 	}
-	glog.V(1).Infof("Watching path %q", path)
-	go util.Forever(config.run, period)
+	store := cache.NewUndeltaStore(send, cache.MetaNamespaceKeyFunc)
+	return &sourceFile{
+		path:           path,
+		nodeName:       nodeName,
+		period:         period,
+		store:          store,
+		fileKeyMapping: map[string]string{},
+		updates:        updates,
+		watchEvents:    make(chan *watchEvent, eventBufferLen),
+	}
 }
 
 func (s *sourceFile) run() {
-	if err := s.extractFromPath(); err != nil {
-		glog.Errorf("Unable to read config path %q: %v", s.path, err)
-	}
+	listTicker := time.NewTicker(s.period)
+
+	go func() {
+		// Read path immediately to speed up startup.
+		if err := s.listConfig(); err != nil {
+			klog.Errorf("Unable to read config path %q: %v", s.path, err)
+		}
+		for {
+			select {
+			case <-listTicker.C:
+				if err := s.listConfig(); err != nil {
+					klog.Errorf("Unable to read config path %q: %v", s.path, err)
+				}
+			case e := <-s.watchEvents:
+				if err := s.consumeWatchEvent(e); err != nil {
+					klog.Errorf("Unable to process watch event: %v", err)
+				}
+			}
+		}
+	}()
+
+	s.startWatch()
 }
 
-func (s *sourceFile) extractFromPath() error {
+func (s *sourceFile) applyDefaults(pod *api.Pod, source string) error {
+	return applyDefaults(pod, source, true, s.nodeName)
+}
+
+func (s *sourceFile) listConfig() error {
 	path := s.path
 	statInfo, err := os.Stat(path)
 	if err != nil {
@@ -66,42 +126,45 @@ func (s *sourceFile) extractFromPath() error {
 			return err
 		}
 		// Emit an update with an empty PodList to allow FileSource to be marked as seen
-		s.updates <- kubelet.PodUpdate{[]api.BoundPod{}, kubelet.SET, kubelet.FileSource}
+		s.updates <- kubetypes.PodUpdate{Pods: []*v1.Pod{}, Op: kubetypes.SET, Source: kubetypes.FileSource}
 		return fmt.Errorf("path does not exist, ignoring")
 	}
 
 	switch {
 	case statInfo.Mode().IsDir():
-		pods, err := extractFromDir(path)
+		pods, err := s.extractFromDir(path)
 		if err != nil {
 			return err
 		}
-		s.updates <- kubelet.PodUpdate{pods, kubelet.SET, kubelet.FileSource}
+		if len(pods) == 0 {
+			// Emit an update with an empty PodList to allow FileSource to be marked as seen
+			s.updates <- kubetypes.PodUpdate{Pods: pods, Op: kubetypes.SET, Source: kubetypes.FileSource}
+			return nil
+		}
+		return s.replaceStore(pods...)
 
 	case statInfo.Mode().IsRegular():
-		pod, err := extractFromFile(path)
+		pod, err := s.extractFromFile(path)
 		if err != nil {
 			return err
 		}
-		s.updates <- kubelet.PodUpdate{[]api.BoundPod{pod}, kubelet.SET, kubelet.FileSource}
+		return s.replaceStore(pod)
 
 	default:
 		return fmt.Errorf("path is not a directory or file")
 	}
-
-	return nil
 }
 
-// Get as many pod configs as we can from a directory.  Return an error iff something
-// prevented us from reading anything at all.  Do not return an error if only some files
+// Get as many pod manifests as we can from a directory. Return an error if and only if something
+// prevented us from reading anything at all. Do not return an error if only some files
 // were problematic.
-func extractFromDir(name string) ([]api.BoundPod, error) {
+func (s *sourceFile) extractFromDir(name string) ([]*v1.Pod, error) {
 	dirents, err := filepath.Glob(filepath.Join(name, "[^.]*"))
 	if err != nil {
 		return nil, fmt.Errorf("glob failed: %v", err)
 	}
 
-	pods := make([]api.BoundPod, 0)
+	pods := make([]*v1.Pod, 0)
 	if len(dirents) == 0 {
 		return pods, nil
 	}
@@ -110,31 +173,42 @@ func extractFromDir(name string) ([]api.BoundPod, error) {
 	for _, path := range dirents {
 		statInfo, err := os.Stat(path)
 		if err != nil {
-			glog.V(1).Infof("Can't get metadata for %q: %v", path, err)
+			klog.Errorf("Can't get metadata for %q: %v", path, err)
 			continue
 		}
 
 		switch {
 		case statInfo.Mode().IsDir():
-			glog.V(1).Infof("Not recursing into config path %q", path)
+			klog.Errorf("Not recursing into manifest path %q", path)
 		case statInfo.Mode().IsRegular():
-			pod, err := extractFromFile(path)
+			pod, err := s.extractFromFile(path)
 			if err != nil {
-				glog.V(1).Infof("Can't process config file %q: %v", path, err)
+				if !os.IsNotExist(err) {
+					klog.Errorf("Can't process manifest file %q: %v", path, err)
+				}
 			} else {
 				pods = append(pods, pod)
 			}
 		default:
-			glog.V(1).Infof("Config path %q is not a directory or file: %v", path, statInfo.Mode())
+			klog.Errorf("Manifest path %q is not a directory or file: %v", path, statInfo.Mode())
 		}
 	}
 	return pods, nil
 }
 
-func extractFromFile(filename string) (api.BoundPod, error) {
-	var pod api.BoundPod
+func (s *sourceFile) extractFromFile(filename string) (pod *v1.Pod, err error) {
+	klog.V(3).Infof("Reading config file %q", filename)
+	defer func() {
+		if err == nil && pod != nil {
+			objKey, keyErr := cache.MetaNamespaceKeyFunc(pod)
+			if keyErr != nil {
+				err = keyErr
+				return
+			}
+			s.fileKeyMapping[filename] = objKey
+		}
+	}()
 
-	glog.V(3).Infof("Reading config file %q", filename)
 	file, err := os.Open(filename)
 	if err != nil {
 		return pod, err
@@ -146,67 +220,25 @@ func extractFromFile(filename string) (api.BoundPod, error) {
 		return pod, err
 	}
 
-	// TODO: use api.Scheme.DecodeInto
-	// This is awful.  DecodeInto() expects to find an APIObject, which
-	// Manifest is not.  We keep reading manifest for now for compat, but
-	// we will eventually change it to read Pod (at which point this all
-	// becomes nicer).  Until then, we assert that the ContainerManifest
-	// structure on disk is always v1beta1.  Read that, convert it to a
-	// "current" ContainerManifest (should be ~identical), then convert
-	// that to a BoundPod (which is a well-understood conversion).  This
-	// avoids writing a v1beta1.ContainerManifest -> api.BoundPod
-	// conversion which would be identical to the api.ContainerManifest ->
-	// api.BoundPod conversion.
-	oldManifest := &v1beta1.ContainerManifest{}
-	if err := yaml.Unmarshal(data, oldManifest); err != nil {
-		return pod, fmt.Errorf("can't unmarshal file %q: %v", filename, err)
-	}
-	newManifest := &api.ContainerManifest{}
-	if err := api.Scheme.Convert(oldManifest, newManifest); err != nil {
-		return pod, fmt.Errorf("can't convert pod from file %q: %v", filename, err)
-	}
-	if err := api.Scheme.Convert(newManifest, &pod); err != nil {
-		return pod, fmt.Errorf("can't convert pod from file %q: %v", filename, err)
+	defaultFn := func(pod *api.Pod) error {
+		return s.applyDefaults(pod, filename)
 	}
 
-	hostname, err := os.Hostname() //TODO: kubelet name would be better
-	if err != nil {
-		return pod, err
+	parsed, pod, podErr := tryDecodeSinglePod(data, defaultFn)
+	if parsed {
+		if podErr != nil {
+			return pod, podErr
+		}
+		return pod, nil
 	}
-	hostname = strings.ToLower(hostname)
 
-	if len(pod.UID) == 0 {
-		hasher := md5.New()
-		fmt.Fprintf(hasher, "host:%s", hostname)
-		fmt.Fprintf(hasher, "file:%s", filename)
-		util.DeepHashObject(hasher, pod)
-		pod.UID = types.UID(hex.EncodeToString(hasher.Sum(nil)[0:]))
-		glog.V(5).Infof("Generated UID %q for pod %q from file %s", pod.UID, pod.Name, filename)
-	}
-	// This is required for backward compatibility, and should be removed once we
-	// completely deprecate ContainerManifest.
-	if len(pod.Name) == 0 {
-		pod.Name = string(pod.UID)
-	}
-	if pod.Name, err = GeneratePodName(pod.Name); err != nil {
-		return pod, err
-	}
-	glog.V(5).Infof("Generated Name %q for UID %q from file %s", pod.Name, pod.UID, filename)
+	return pod, fmt.Errorf("%v: couldn't parse as pod(%v), please check config file.\n", filename, podErr)
+}
 
-	// Always overrides the namespace provided by the file.
-	pod.Namespace = kubelet.NamespaceDefault
-	glog.V(5).Infof("Using namespace %q for pod %q from file %s", pod.Namespace, pod.Name, filename)
-
-	// TODO(dchen1107): BoundPod is not type of runtime.Object. Once we allow kubelet talks
-	// about Pod directly, we can use SelfLinker defined in package: latest
-	// Currently just simply follow the same format in resthandler.go
-	pod.ObjectMeta.SelfLink = fmt.Sprintf("/api/v1beta2/pods/%s?namespace=%s",
-		pod.Name, pod.Namespace)
-
-	if glog.V(4) {
-		glog.Infof("Got pod from file %q: %#v", filename, pod)
-	} else {
-		glog.V(1).Infof("Got pod from file %q: %s.%s (%s)", filename, pod.Namespace, pod.Name, pod.UID)
+func (s *sourceFile) replaceStore(pods ...*v1.Pod) (err error) {
+	objs := []interface{}{}
+	for _, pod := range pods {
+		objs = append(objs, pod)
 	}
-	return pod, nil
+	return s.store.Replace(objs, "")
 }

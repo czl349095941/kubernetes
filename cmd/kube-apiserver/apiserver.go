@@ -1,5 +1,5 @@
 /*
-Copyright 2014 Google Inc. All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,29 +20,31 @@ package main
 
 import (
 	"fmt"
+	"math/rand"
 	"os"
-	"runtime"
+	"time"
 
-	"github.com/GoogleCloudPlatform/kubernetes/cmd/kube-apiserver/app"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/util"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/version/verflag"
-
-	"github.com/spf13/pflag"
+	"k8s.io/apiserver/pkg/server"
+	"k8s.io/apiserver/pkg/util/logs"
+	"k8s.io/kubernetes/cmd/kube-apiserver/app"
+	_ "k8s.io/kubernetes/pkg/client/metrics/prometheus" // for client metric registration
+	_ "k8s.io/kubernetes/pkg/version/prometheus"        // for version metric registration
 )
 
 func main() {
-	runtime.GOMAXPROCS(runtime.NumCPU())
-	s := app.NewAPIServer()
-	s.AddFlags(pflag.CommandLine)
+	rand.Seed(time.Now().UnixNano())
 
-	util.InitFlags()
-	util.InitLogs()
-	defer util.FlushLogs()
+	command := app.NewAPIServerCommand(server.SetupSignalHandler())
 
-	verflag.PrintAndExitIfRequested()
+	// TODO: once we switch everything over to Cobra commands, we can go back to calling
+	// utilflag.InitFlags() (by removing its pflag.Parse() call). For now, we have to set the
+	// normalize func and add the go flag set by hand.
+	// utilflag.InitFlags()
+	logs.InitLogs()
+	defer logs.FlushLogs()
 
-	if err := s.Run(pflag.CommandLine.Args()); err != nil {
-		fmt.Fprint(os.Stderr, err.Error)
+	if err := command.Execute(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 }

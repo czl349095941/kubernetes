@@ -1,5 +1,5 @@
 /*
-Copyright 2014 Google Inc. All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ limitations under the License.
 package config
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -25,43 +26,45 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/client/clientcmd"
-)
-
-const (
-	cannotHaveStepsAfterError                = "Cannot have steps after %v.  %v are remaining"
-	additionStepRequiredUnlessUnsettingError = "Must have additional steps after %v unless you are unsetting it"
+	"k8s.io/apiserver/pkg/util/flag"
+	"k8s.io/client-go/tools/clientcmd"
+	cmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
+	"k8s.io/kubernetes/pkg/kubectl/util/i18n"
+	"k8s.io/kubernetes/pkg/kubectl/util/templates"
 )
 
 type setOptions struct {
-	pathOptions   *pathOptions
+	configAccess  clientcmd.ConfigAccess
 	propertyName  string
 	propertyValue string
+	setRawBytes   flag.Tristate
 }
 
-const set_long = `Sets an individual value in a .kubeconfig file
-PROPERTY_NAME is a dot delimited name where each token represents either a attribute name or a map key.  Map keys may not contain dots.
-PROPERTY_VALUE is the new value you wish to set.`
+var setLong = templates.LongDesc(`
+	Sets an individual value in a kubeconfig file
 
-func NewCmdConfigSet(out io.Writer, pathOptions *pathOptions) *cobra.Command {
-	options := &setOptions{pathOptions: pathOptions}
+	PROPERTY_NAME is a dot delimited name where each token represents either an attribute name or a map key.  Map keys may not contain dots.
+
+	PROPERTY_VALUE is the new value you wish to set. Binary fields such as 'certificate-authority-data' expect a base64 encoded string unless the --set-raw-bytes flag is used.`)
+
+// NewCmdConfigSet returns a Command instance for 'config set' sub command
+func NewCmdConfigSet(out io.Writer, configAccess clientcmd.ConfigAccess) *cobra.Command {
+	options := &setOptions{configAccess: configAccess}
 
 	cmd := &cobra.Command{
-		Use:   "set PROPERTY_NAME PROPERTY_VALUE",
-		Short: "Sets an individual value in a .kubeconfig file",
-		Long:  set_long,
+		Use:                   "set PROPERTY_NAME PROPERTY_VALUE",
+		DisableFlagsInUseLine: true,
+		Short:                 i18n.T("Sets an individual value in a kubeconfig file"),
+		Long:                  setLong,
 		Run: func(cmd *cobra.Command, args []string) {
-			if !options.complete(cmd) {
-				return
-			}
-
-			err := options.run()
-			if err != nil {
-				fmt.Printf("%v\n", err)
-			}
+			cmdutil.CheckErr(options.complete(cmd))
+			cmdutil.CheckErr(options.run())
+			fmt.Fprintf(out, "Property %q set.\n", options.propertyName)
 		},
 	}
 
+	f := cmd.Flags().VarPF(&options.setRawBytes, "set-raw-bytes", "", "When writing a []byte PROPERTY_VALUE, write the given string directly without base64 decoding.")
+	f.NoOptDefVal = "true"
 	return cmd
 }
 
@@ -71,57 +74,56 @@ func (o setOptions) run() error {
 		return err
 	}
 
-	config, filename, err := o.pathOptions.getStartingConfig()
+	config, err := o.configAccess.GetStartingConfig()
 	if err != nil {
 		return err
 	}
-
-	if len(filename) == 0 {
-		return errors.New("cannot set property without using a specific file")
-	}
-
 	steps, err := newNavigationSteps(o.propertyName)
 	if err != nil {
 		return err
 	}
-	err = modifyConfig(reflect.ValueOf(config), steps, o.propertyValue, false)
+
+	setRawBytes := false
+	if o.setRawBytes.Provided() {
+		setRawBytes = o.setRawBytes.Value()
+	}
+
+	err = modifyConfig(reflect.ValueOf(config), steps, o.propertyValue, false, setRawBytes)
 	if err != nil {
 		return err
 	}
 
-	err = clientcmd.WriteToFile(*config, filename)
-	if err != nil {
+	if err := clientcmd.ModifyConfig(o.configAccess, *config, false); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func (o *setOptions) complete(cmd *cobra.Command) bool {
+func (o *setOptions) complete(cmd *cobra.Command) error {
 	endingArgs := cmd.Flags().Args()
 	if len(endingArgs) != 2 {
-		cmd.Help()
-		return false
+		return helpErrorf(cmd, "Unexpected args: %v", endingArgs)
 	}
 
 	o.propertyValue = endingArgs[1]
 	o.propertyName = endingArgs[0]
-	return true
+	return nil
 }
 
 func (o setOptions) validate() error {
 	if len(o.propertyValue) == 0 {
-		return errors.New("You cannot use set to unset a property")
+		return errors.New("you cannot use set to unset a property")
 	}
 
 	if len(o.propertyName) == 0 {
-		return errors.New("You must specify a property")
+		return errors.New("you must specify a property")
 	}
 
 	return nil
 }
 
-func modifyConfig(curr reflect.Value, steps *navigationSteps, propertyValue string, unset bool) error {
+func modifyConfig(curr reflect.Value, steps *navigationSteps, propertyValue string, unset bool, setRawBytes bool) error {
 	currStep := steps.pop()
 
 	actualCurrValue := curr
@@ -132,7 +134,7 @@ func modifyConfig(curr reflect.Value, steps *navigationSteps, propertyValue stri
 	switch actualCurrValue.Kind() {
 	case reflect.Map:
 		if !steps.moreStepsRemaining() && !unset {
-			return fmt.Errorf("Can't set a map to a value: %v", actualCurrValue)
+			return fmt.Errorf("can't set a map to a value: %v", actualCurrValue)
 		}
 
 		mapKey := reflect.ValueOf(currStep.stepValue)
@@ -147,38 +149,55 @@ func modifyConfig(curr reflect.Value, steps *navigationSteps, propertyValue stri
 
 		needToSetNewMapValue := currMapValue.Kind() == reflect.Invalid
 		if needToSetNewMapValue {
-			currMapValue = reflect.New(mapValueType).Elem()
+			if unset {
+				return fmt.Errorf("current map key `%v` is invalid", mapKey.Interface())
+			}
+			currMapValue = reflect.New(mapValueType.Elem()).Elem().Addr()
 			actualCurrValue.SetMapIndex(mapKey, currMapValue)
 		}
 
-		// our maps do not hold pointers to structs, they hold the structs themselves.  This means that MapIndex returns the struct itself
-		// That in turn means that they have kinds of type.Struct, which is not a settable type.  Because of this, we need to make new struct of that type
-		// copy all the data from the old value into the new value, then take the .addr of the new value to modify it in the next recursion.
-		// clear as mud
-		modifiableMapValue := reflect.New(currMapValue.Type()).Elem()
-		modifiableMapValue.Set(currMapValue)
-
-		if modifiableMapValue.Kind() == reflect.Struct {
-			modifiableMapValue = modifiableMapValue.Addr()
-		}
-		err := modifyConfig(modifiableMapValue, steps, propertyValue, unset)
+		err := modifyConfig(currMapValue, steps, propertyValue, unset, setRawBytes)
 		if err != nil {
 			return err
 		}
 
-		actualCurrValue.SetMapIndex(mapKey, reflect.Indirect(modifiableMapValue))
 		return nil
 
 	case reflect.String:
 		if steps.moreStepsRemaining() {
-			return fmt.Errorf("Can't have more steps after a string. %v", steps)
+			return fmt.Errorf("can't have more steps after a string. %v", steps)
 		}
 		actualCurrValue.SetString(propertyValue)
 		return nil
 
+	case reflect.Slice:
+		if steps.moreStepsRemaining() {
+			return fmt.Errorf("can't have more steps after bytes. %v", steps)
+		}
+		innerKind := actualCurrValue.Type().Elem().Kind()
+		if innerKind != reflect.Uint8 {
+			return fmt.Errorf("unrecognized slice type. %v", innerKind)
+		}
+
+		if unset {
+			actualCurrValue.Set(reflect.Zero(actualCurrValue.Type()))
+			return nil
+		}
+
+		if setRawBytes {
+			actualCurrValue.SetBytes([]byte(propertyValue))
+		} else {
+			val, err := base64.StdEncoding.DecodeString(propertyValue)
+			if err != nil {
+				return fmt.Errorf("error decoding input value: %v", err)
+			}
+			actualCurrValue.SetBytes(val)
+		}
+		return nil
+
 	case reflect.Bool:
 		if steps.moreStepsRemaining() {
-			return fmt.Errorf("Can't have more steps after a bool. %v", steps)
+			return fmt.Errorf("can't have more steps after a bool. %v", steps)
 		}
 		boolValue, err := toBool(propertyValue)
 		if err != nil {
@@ -213,13 +232,13 @@ func modifyConfig(curr reflect.Value, steps *navigationSteps, propertyValue stri
 					return nil
 				}
 
-				return modifyConfig(currFieldValue.Addr(), steps, propertyValue, unset)
+				return modifyConfig(currFieldValue.Addr(), steps, propertyValue, unset, setRawBytes)
 			}
 		}
 
-		return fmt.Errorf("Unable to locate path %#v under %v", currStep, actualCurrValue)
+		return fmt.Errorf("unable to locate path %#v under %v", currStep, actualCurrValue)
 
 	}
 
-	return fmt.Errorf("Unrecognized type: %v", actualCurrValue)
+	panic(fmt.Errorf("unrecognized type: %v", actualCurrValue))
 }

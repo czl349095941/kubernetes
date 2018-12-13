@@ -1,5 +1,5 @@
 /*
-Copyright 2014 Google Inc. All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,121 +18,58 @@ package config
 
 import (
 	"fmt"
-	"io"
-	"os"
+	"path"
 	"strconv"
 
-	"github.com/golang/glog"
 	"github.com/spf13/cobra"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/client/clientcmd"
-	clientcmdapi "github.com/GoogleCloudPlatform/kubernetes/pkg/client/clientcmd/api"
+	"k8s.io/cli-runtime/pkg/genericclioptions"
+	"k8s.io/client-go/tools/clientcmd"
+	cmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
+	"k8s.io/kubernetes/pkg/kubectl/util/i18n"
+	"k8s.io/kubernetes/pkg/kubectl/util/templates"
 )
 
-type pathOptions struct {
-	local         bool
-	global        bool
-	envvar        bool
-	specifiedFile string
-}
-
-func NewCmdConfig(out io.Writer) *cobra.Command {
-	pathOptions := &pathOptions{}
+// NewCmdConfig creates a command object for the "config" action, and adds all child commands to it.
+func NewCmdConfig(f cmdutil.Factory, pathOptions *clientcmd.PathOptions, streams genericclioptions.IOStreams) *cobra.Command {
+	if len(pathOptions.ExplicitFileFlag) == 0 {
+		pathOptions.ExplicitFileFlag = clientcmd.RecommendedConfigPathFlag
+	}
 
 	cmd := &cobra.Command{
-		Use:   "config SUBCOMMAND",
-		Short: "config modifies .kubeconfig files",
-		Long:  `config modifies .kubeconfig files using subcommands like "kubectl config set current-context my-context"`,
-		Run: func(cmd *cobra.Command, args []string) {
-			cmd.Help()
-		},
+		Use:                   "config SUBCOMMAND",
+		DisableFlagsInUseLine: true,
+		Short:                 i18n.T("Modify kubeconfig files"),
+		Long: templates.LongDesc(`
+			Modify kubeconfig files using subcommands like "kubectl config set current-context my-context"
+
+			The loading order follows these rules:
+
+			1. If the --` + pathOptions.ExplicitFileFlag + ` flag is set, then only that file is loaded. The flag may only be set once and no merging takes place.
+			2. If $` + pathOptions.EnvVar + ` environment variable is set, then it is used as a list of paths (normal path delimiting rules for your system). These paths are merged. When a value is modified, it is modified in the file that defines the stanza. When a value is created, it is created in the first file that exists. If no files in the chain exist, then it creates the last file in the list.
+			3. Otherwise, ` + path.Join("${HOME}", pathOptions.GlobalFileSubpath) + ` is used and no merging takes place.`),
+		Run: cmdutil.DefaultSubCommandRun(streams.ErrOut),
 	}
 
 	// file paths are common to all sub commands
-	cmd.PersistentFlags().BoolVar(&pathOptions.local, "local", false, "use the .kubeconfig in the current directory")
-	cmd.PersistentFlags().BoolVar(&pathOptions.global, "global", false, "use the .kubeconfig from "+os.Getenv("HOME"))
-	cmd.PersistentFlags().BoolVar(&pathOptions.envvar, "envvar", false, "use the .kubeconfig from $KUBECONFIG")
-	cmd.PersistentFlags().StringVar(&pathOptions.specifiedFile, "kubeconfig", "", "use a particular .kubeconfig file")
+	cmd.PersistentFlags().StringVar(&pathOptions.LoadingRules.ExplicitPath, pathOptions.ExplicitFileFlag, pathOptions.LoadingRules.ExplicitPath, "use a particular kubeconfig file")
 
-	cmd.AddCommand(NewCmdConfigView(out, pathOptions))
-	cmd.AddCommand(NewCmdConfigSetCluster(out, pathOptions))
-	cmd.AddCommand(NewCmdConfigSetAuthInfo(out, pathOptions))
-	cmd.AddCommand(NewCmdConfigSetContext(out, pathOptions))
-	cmd.AddCommand(NewCmdConfigSet(out, pathOptions))
-	cmd.AddCommand(NewCmdConfigUnset(out, pathOptions))
-	cmd.AddCommand(NewCmdConfigUseContext(out, pathOptions))
+	// TODO(juanvallejo): update all subcommands to work with genericclioptions.IOStreams
+	cmd.AddCommand(NewCmdConfigView(f, streams, pathOptions))
+	cmd.AddCommand(NewCmdConfigSetCluster(streams.Out, pathOptions))
+	cmd.AddCommand(NewCmdConfigSetAuthInfo(streams.Out, pathOptions))
+	cmd.AddCommand(NewCmdConfigSetContext(streams.Out, pathOptions))
+	cmd.AddCommand(NewCmdConfigSet(streams.Out, pathOptions))
+	cmd.AddCommand(NewCmdConfigUnset(streams.Out, pathOptions))
+	cmd.AddCommand(NewCmdConfigCurrentContext(streams.Out, pathOptions))
+	cmd.AddCommand(NewCmdConfigUseContext(streams.Out, pathOptions))
+	cmd.AddCommand(NewCmdConfigGetContexts(streams, pathOptions))
+	cmd.AddCommand(NewCmdConfigGetClusters(streams.Out, pathOptions))
+	cmd.AddCommand(NewCmdConfigDeleteCluster(streams.Out, pathOptions))
+	cmd.AddCommand(NewCmdConfigDeleteContext(streams.Out, streams.ErrOut, pathOptions))
+	cmd.AddCommand(NewCmdConfigRenameContext(streams.Out, pathOptions))
 
 	return cmd
-}
-
-func (o *pathOptions) getStartingConfig() (*clientcmdapi.Config, string, error) {
-	filename := ""
-	config := clientcmdapi.NewConfig()
-
-	if len(o.specifiedFile) > 0 {
-		filename = o.specifiedFile
-		config = getConfigFromFileOrDie(filename)
-	}
-
-	if o.global {
-		if len(filename) > 0 {
-			return nil, "", fmt.Errorf("already loading from %v, cannot specify global as well", filename)
-		}
-
-		filename = os.Getenv("HOME") + "/.kube/.kubeconfig"
-		config = getConfigFromFileOrDie(filename)
-	}
-
-	if o.envvar {
-		if len(filename) > 0 {
-			return nil, "", fmt.Errorf("already loading from %v, cannot specify global as well", filename)
-		}
-
-		filename = os.Getenv(clientcmd.RecommendedConfigPathEnvVar)
-		if len(filename) == 0 {
-			return nil, "", fmt.Errorf("environment variable %v does not have a value", clientcmd.RecommendedConfigPathEnvVar)
-		}
-
-		config = getConfigFromFileOrDie(filename)
-	}
-
-	if o.local {
-		if len(filename) > 0 {
-			return nil, "", fmt.Errorf("already loading from %v, cannot specify global as well", filename)
-		}
-
-		filename = ".kubeconfig"
-		config = getConfigFromFileOrDie(filename)
-
-	}
-
-	// no specific flag was set, first attempt to use the envvar, then use local
-	if len(filename) == 0 {
-		if len(os.Getenv(clientcmd.RecommendedConfigPathEnvVar)) > 0 {
-			filename = os.Getenv(clientcmd.RecommendedConfigPathEnvVar)
-			config = getConfigFromFileOrDie(filename)
-		} else {
-			filename = ".kubeconfig"
-			config = getConfigFromFileOrDie(filename)
-		}
-	}
-
-	return config, filename, nil
-}
-
-// getConfigFromFileOrDie tries to read a kubeconfig file and if it can't, it calls exit.  One exception, missing files result in empty configs, not an exit
-func getConfigFromFileOrDie(filename string) *clientcmdapi.Config {
-	var err error
-	config, err := clientcmd.LoadFromFile(filename)
-	if err != nil && !os.IsNotExist(err) {
-		glog.FatalDepth(1, err)
-	}
-
-	if config == nil {
-		config = clientcmdapi.NewConfig()
-	}
-
-	return config
 }
 
 func toBool(propertyValue string) (bool, error) {
@@ -146,4 +83,10 @@ func toBool(propertyValue string) (bool, error) {
 	}
 
 	return boolValue, nil
+}
+
+func helpErrorf(cmd *cobra.Command, format string, args ...interface{}) error {
+	cmd.Help()
+	msg := fmt.Sprintf(format, args...)
+	return fmt.Errorf("%s", msg)
 }

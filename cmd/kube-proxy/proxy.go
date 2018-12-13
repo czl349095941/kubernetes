@@ -1,5 +1,5 @@
 /*
-Copyright 2014 Google Inc. All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,30 +17,37 @@ limitations under the License.
 package main
 
 import (
+	goflag "flag"
 	"fmt"
+	"math/rand"
 	"os"
-	"runtime"
-
-	"github.com/GoogleCloudPlatform/kubernetes/cmd/kube-proxy/app"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/util"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/version/verflag"
+	"time"
 
 	"github.com/spf13/pflag"
+
+	utilflag "k8s.io/apiserver/pkg/util/flag"
+	"k8s.io/apiserver/pkg/util/logs"
+	"k8s.io/kubernetes/cmd/kube-proxy/app"
+	_ "k8s.io/kubernetes/pkg/client/metrics/prometheus" // for client metric registration
+	_ "k8s.io/kubernetes/pkg/version/prometheus"        // for version metric registration
 )
 
 func main() {
-	runtime.GOMAXPROCS(runtime.NumCPU())
-	s := app.NewProxyServer()
-	s.AddFlags(pflag.CommandLine)
+	rand.Seed(time.Now().UnixNano())
 
-	util.InitFlags()
-	util.InitLogs()
-	defer util.FlushLogs()
+	command := app.NewProxyCommand()
 
-	verflag.PrintAndExitIfRequested()
+	// TODO: once we switch everything over to Cobra commands, we can go back to calling
+	// utilflag.InitFlags() (by removing its pflag.Parse() call). For now, we have to set the
+	// normalize func and add the go flag set by hand.
+	pflag.CommandLine.SetNormalizeFunc(utilflag.WordSepNormalizeFunc)
+	pflag.CommandLine.AddGoFlagSet(goflag.CommandLine)
+	// utilflag.InitFlags()
+	logs.InitLogs()
+	defer logs.FlushLogs()
 
-	if err := s.Run(pflag.CommandLine.Args()); err != nil {
-		fmt.Fprint(os.Stderr, err.Error)
+	if err := command.Execute(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 }

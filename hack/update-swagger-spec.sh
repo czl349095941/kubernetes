@@ -1,6 +1,6 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Copyright 2015 Google Inc. All rights reserved.
+# Copyright 2015 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,57 +15,82 @@
 # limitations under the License.
 
 # Script to fetch latest swagger spec.
-# Puts the updated spec at swagger-spec/
+# Puts the updated spec at api/swagger-spec/
 
 set -o errexit
 set -o nounset
 set -o pipefail
 
+cat << __EOF__
+Note: This assumes that the 'types_swagger_doc_generated.go' file has been
+updated for all API group versions. If you are unsure, please run
+hack/update-generated-swagger-docs.sh first.
+__EOF__
+
 KUBE_ROOT=$(dirname "${BASH_SOURCE}")/..
 SWAGGER_ROOT_DIR="${KUBE_ROOT}/api/swagger-spec"
 source "${KUBE_ROOT}/hack/lib/init.sh"
 
+kube::golang::setup_env
+
+make -C "${KUBE_ROOT}" WHAT=cmd/kube-apiserver
+
 function cleanup()
 {
-    [[ -n ${APISERVER_PID-} ]] && kill ${APISERVER_PID} 1>&2 2>/dev/null
+    if [[ -n "${APISERVER_PID-}" ]]; then
+      kill "${APISERVER_PID}" &>/dev/null || :
+      wait "${APISERVER_PID}" &>/dev/null || :
+    fi
 
     kube::etcd::cleanup
 
     kube::log::status "Clean up complete"
 }
 
-trap cleanup EXIT SIGINT
+kube::util::trap_add cleanup EXIT
+
+kube::golang::setup_env
+
+apiserver=$(kube::util::find-binary "kube-apiserver")
+
+TMP_DIR=$(mktemp -d /tmp/update-swagger-spec.XXXX)
+ETCD_HOST=${ETCD_HOST:-127.0.0.1}
+ETCD_PORT=${ETCD_PORT:-2379}
+API_PORT=${API_PORT:-8050}
+API_HOST=${API_HOST:-127.0.0.1}
+API_LOGFILE=${API_LOGFILE:-/tmp/swagger-api-server.log}
 
 kube::etcd::start
 
-ETCD_HOST=${ETCD_HOST:-127.0.0.1}
-ETCD_PORT=${ETCD_PORT:-4001}
-API_PORT=${API_PORT:-8050}
-API_HOST=${API_HOST:-127.0.0.1}
-KUBELET_PORT=${KUBELET_PORT:-10250}
 
-# Start kube-apiserver
+# Start kube-apiserver, with alpha api versions on so we can harvest their swagger docs
+# Set --runtime-config to all versions in KUBE_AVAILABLE_GROUP_VERSIONS to enable alpha features.
 kube::log::status "Starting kube-apiserver"
 "${KUBE_OUTPUT_HOSTBIN}/kube-apiserver" \
-  --address="127.0.0.1" \
-  --public_address_override="127.0.0.1" \
-  --port="${API_PORT}" \
-  --etcd_servers="http://${ETCD_HOST}:${ETCD_PORT}" \
-  --public_address_override="127.0.0.1" \
-  --kubelet_port=${KUBELET_PORT} \
-  --runtime_config=api/v1beta3 \
-  --portal_net="10.0.0.0/24" 1>&2 &
+  --insecure-bind-address="${API_HOST}" \
+  --bind-address="${API_HOST}" \
+  --insecure-port="${API_PORT}" \
+  --etcd-servers="http://${ETCD_HOST}:${ETCD_PORT}" \
+  --advertise-address="10.10.10.10" \
+  --cert-dir="${TMP_DIR}/certs" \
+  --runtime-config=$(echo "${KUBE_AVAILABLE_GROUP_VERSIONS}" | sed -E 's|[[:blank:]]+|,|g') \
+  --service-cluster-ip-range="10.0.0.0/24" >"${API_LOGFILE}" 2>&1 &
 APISERVER_PID=$!
 
-kube::util::wait_for_url "http://127.0.0.1:${API_PORT}/healthz" "apiserver: "
+if ! kube::util::wait_for_url "${API_HOST}:${API_PORT}/healthz" "apiserver: "; then
+  kube::log::error "Here are the last 10 lines from kube-apiserver (${API_LOGFILE})"
+  kube::log::error "=== BEGIN OF LOG ==="
+  tail -10 "${API_LOGFILE}" || :
+  kube::log::error "=== END OF LOG ==="
+  exit 1
+fi
 
-SWAGGER_API_PATH="http://127.0.0.1:${API_PORT}/swaggerapi/"
+SWAGGER_API_PATH="${API_HOST}:${API_PORT}/swaggerapi/"
+
 kube::log::status "Updating " ${SWAGGER_ROOT_DIR}
-curl ${SWAGGER_API_PATH} > ${SWAGGER_ROOT_DIR}/resourceListing.json
-curl ${SWAGGER_API_PATH}version > ${SWAGGER_ROOT_DIR}/version.json
-curl ${SWAGGER_API_PATH}api > ${SWAGGER_ROOT_DIR}/api.json
-curl ${SWAGGER_API_PATH}api/v1beta1 > ${SWAGGER_ROOT_DIR}/v1beta1.json
-curl ${SWAGGER_API_PATH}api/v1beta2 > ${SWAGGER_ROOT_DIR}/v1beta2.json
-curl ${SWAGGER_API_PATH}api/v1beta3 > ${SWAGGER_ROOT_DIR}/v1beta3.json
+
+SWAGGER_API_PATH="${SWAGGER_API_PATH}" SWAGGER_ROOT_DIR="${SWAGGER_ROOT_DIR}" VERSIONS="${KUBE_AVAILABLE_GROUP_VERSIONS}" KUBE_NONSERVER_GROUP_VERSIONS="${KUBE_NONSERVER_GROUP_VERSIONS}" kube::util::fetch-swagger-spec
 
 kube::log::status "SUCCESS"
+
+# ex: ts=2 sw=2 et filetype=sh

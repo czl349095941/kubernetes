@@ -1,5 +1,5 @@
 /*
-Copyright 2014 Google Inc. All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,397 +17,556 @@ limitations under the License.
 package cmd
 
 import (
+	"flag"
 	"fmt"
 	"io"
 	"os"
-
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api/latest"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api/meta"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/api/validation"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/client"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/client/clientcmd"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/kubectl"
-	cmdconfig "github.com/GoogleCloudPlatform/kubernetes/pkg/kubectl/cmd/config"
-	cmdutil "github.com/GoogleCloudPlatform/kubernetes/pkg/kubectl/cmd/util"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/kubectl/resource"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/runtime"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/util"
+	"os/exec"
+	"runtime"
+	"strings"
+	"syscall"
 
 	"github.com/spf13/cobra"
-	"github.com/spf13/pflag"
+
+	utilflag "k8s.io/apiserver/pkg/util/flag"
+	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/annotate"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/apiresources"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/apply"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/attach"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/auth"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/autoscale"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/certificates"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/clusterinfo"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/completion"
+	cmdconfig "k8s.io/kubernetes/pkg/kubectl/cmd/config"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/convert"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/cp"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/create"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/delete"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/describe"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/diff"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/drain"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/edit"
+	cmdexec "k8s.io/kubernetes/pkg/kubectl/cmd/exec"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/explain"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/expose"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/get"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/label"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/logs"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/options"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/patch"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/plugin"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/portforward"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/proxy"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/replace"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/rollingupdate"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/rollout"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/run"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/scale"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/set"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/taint"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/top"
+	cmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/version"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/wait"
+	"k8s.io/kubernetes/pkg/kubectl/util/i18n"
+	"k8s.io/kubernetes/pkg/kubectl/util/templates"
+
+	"k8s.io/cli-runtime/pkg/genericclioptions"
 )
 
 const (
-	FlagMatchBinaryVersion = "match-server-version"
+	bashCompletionFunc = `# call kubectl get $1,
+__kubectl_override_flag_list=(--kubeconfig --cluster --user --context --namespace --server -n -s)
+__kubectl_override_flags()
+{
+    local ${__kubectl_override_flag_list[*]##*-} two_word_of of var
+    for w in "${words[@]}"; do
+        if [ -n "${two_word_of}" ]; then
+            eval "${two_word_of##*-}=\"${two_word_of}=\${w}\""
+            two_word_of=
+            continue
+        fi
+        for of in "${__kubectl_override_flag_list[@]}"; do
+            case "${w}" in
+                ${of}=*)
+                    eval "${of##*-}=\"${w}\""
+                    ;;
+                ${of})
+                    two_word_of="${of}"
+                    ;;
+            esac
+        done
+    done
+    for var in "${__kubectl_override_flag_list[@]##*-}"; do
+        if eval "test -n \"\$${var}\""; then
+            eval "echo \${${var}}"
+        fi
+    done
+}
+
+__kubectl_config_get_contexts()
+{
+    __kubectl_parse_config "contexts"
+}
+
+__kubectl_config_get_clusters()
+{
+    __kubectl_parse_config "clusters"
+}
+
+__kubectl_config_get_users()
+{
+    __kubectl_parse_config "users"
+}
+
+# $1 has to be "contexts", "clusters" or "users"
+__kubectl_parse_config()
+{
+    local template kubectl_out
+    template="{{ range .$1  }}{{ .name }} {{ end }}"
+    if kubectl_out=$(kubectl config $(__kubectl_override_flags) -o template --template="${template}" view 2>/dev/null); then
+        COMPREPLY=( $( compgen -W "${kubectl_out[*]}" -- "$cur" ) )
+    fi
+}
+
+# $1 is the name of resource (required)
+# $2 is template string for kubectl get (optional)
+__kubectl_parse_get()
+{
+    local template
+    template="${2:-"{{ range .items  }}{{ .metadata.name }} {{ end }}"}"
+    local kubectl_out
+    if kubectl_out=$(kubectl get $(__kubectl_override_flags) -o template --template="${template}" "$1" 2>/dev/null); then
+        COMPREPLY+=( $( compgen -W "${kubectl_out[*]}" -- "$cur" ) )
+    fi
+}
+
+__kubectl_get_resource()
+{
+    if [[ ${#nouns[@]} -eq 0 ]]; then
+      local kubectl_out
+      if kubectl_out=$(kubectl api-resources $(__kubectl_override_flags) -o name --cached --request-timeout=5s --verbs=get 2>/dev/null); then
+          COMPREPLY=( $( compgen -W "${kubectl_out[*]}" -- "$cur" ) )
+          return 0
+      fi
+      return 1
+    fi
+    __kubectl_parse_get "${nouns[${#nouns[@]} -1]}"
+}
+
+__kubectl_get_resource_namespace()
+{
+    __kubectl_parse_get "namespace"
+}
+
+__kubectl_get_resource_pod()
+{
+    __kubectl_parse_get "pod"
+}
+
+__kubectl_get_resource_rc()
+{
+    __kubectl_parse_get "rc"
+}
+
+__kubectl_get_resource_node()
+{
+    __kubectl_parse_get "node"
+}
+
+__kubectl_get_resource_clusterrole()
+{
+    __kubectl_parse_get "clusterrole"
+}
+
+# $1 is the name of the pod we want to get the list of containers inside
+__kubectl_get_containers()
+{
+    local template
+    template="{{ range .spec.initContainers }}{{ .name }} {{end}}{{ range .spec.containers  }}{{ .name }} {{ end }}"
+    __kubectl_debug "${FUNCNAME} nouns are ${nouns[*]}"
+
+    local len="${#nouns[@]}"
+    if [[ ${len} -ne 1 ]]; then
+        return
+    fi
+    local last=${nouns[${len} -1]}
+    local kubectl_out
+    if kubectl_out=$(kubectl get $(__kubectl_override_flags) -o template --template="${template}" pods "${last}" 2>/dev/null); then
+        COMPREPLY=( $( compgen -W "${kubectl_out[*]}" -- "$cur" ) )
+    fi
+}
+
+# Require both a pod and a container to be specified
+__kubectl_require_pod_and_container()
+{
+    if [[ ${#nouns[@]} -eq 0 ]]; then
+        __kubectl_parse_get pods
+        return 0
+    fi;
+    __kubectl_get_containers
+    return 0
+}
+
+__kubectl_cp()
+{
+    if [[ $(type -t compopt) = "builtin" ]]; then
+        compopt -o nospace
+    fi
+
+    case "$cur" in
+        /*|[.~]*) # looks like a path
+            return
+            ;;
+        *:*) # TODO: complete remote files in the pod
+            return
+            ;;
+        */*) # complete <namespace>/<pod>
+            local template namespace kubectl_out
+            template="{{ range .items }}{{ .metadata.namespace }}/{{ .metadata.name }}: {{ end }}"
+            namespace="${cur%%/*}"
+            if kubectl_out=( $(kubectl get $(__kubectl_override_flags) --namespace "${namespace}" -o template --template="${template}" pods 2>/dev/null) ); then
+                COMPREPLY=( $(compgen -W "${kubectl_out[*]}" -- "${cur}") )
+            fi
+            return
+            ;;
+        *) # complete namespaces, pods, and filedirs
+            __kubectl_parse_get "namespace" "{{ range .items  }}{{ .metadata.name }}/ {{ end }}"
+            __kubectl_parse_get "pod" "{{ range .items  }}{{ .metadata.name }}: {{ end }}"
+            _filedir
+            ;;
+    esac
+}
+
+__custom_func() {
+    case ${last_command} in
+        kubectl_get | kubectl_describe | kubectl_delete | kubectl_label | kubectl_edit | kubectl_patch |\
+        kubectl_annotate | kubectl_expose | kubectl_scale | kubectl_autoscale | kubectl_taint | kubectl_rollout_* |\
+        kubectl_apply_edit-last-applied | kubectl_apply_view-last-applied)
+            __kubectl_get_resource
+            return
+            ;;
+        kubectl_logs | kubectl_attach)
+            __kubectl_require_pod_and_container
+            return
+            ;;
+        kubectl_exec | kubectl_port-forward | kubectl_top_pod)
+            __kubectl_get_resource_pod
+            return
+            ;;
+        kubectl_rolling-update)
+            __kubectl_get_resource_rc
+            return
+            ;;
+        kubectl_cordon | kubectl_uncordon | kubectl_drain | kubectl_top_node)
+            __kubectl_get_resource_node
+            return
+            ;;
+        kubectl_config_use-context | kubectl_config_rename-context)
+            __kubectl_config_get_contexts
+            return
+            ;;
+        kubectl_config_delete-cluster)
+            __kubectl_config_get_clusters
+            return
+            ;;
+        kubectl_cp)
+            __kubectl_cp
+            return
+            ;;
+        *)
+            ;;
+    esac
+}
+`
 )
 
-// Factory provides abstractions that allow the Kubectl command to be extended across multiple types
-// of resources and different API sets.
-// TODO: make the functions interfaces
-type Factory struct {
-	clients *clientCache
-	flags   *pflag.FlagSet
+var (
+	bashCompletionFlags = map[string]string{
+		"namespace": "__kubectl_get_resource_namespace",
+		"context":   "__kubectl_config_get_contexts",
+		"cluster":   "__kubectl_config_get_clusters",
+		"user":      "__kubectl_config_get_users",
+	}
+)
 
-	// Returns interfaces for dealing with arbitrary runtime.Objects.
-	Object func(cmd *cobra.Command) (meta.RESTMapper, runtime.ObjectTyper)
-	// Returns a client for accessing Kubernetes resources or an error.
-	Client func(cmd *cobra.Command) (*client.Client, error)
-	// Returns a client.Config for accessing the Kubernetes server.
-	ClientConfig func(cmd *cobra.Command) (*client.Config, error)
-	// Returns a RESTClient for working with the specified RESTMapping or an error. This is intended
-	// for working with arbitrary resources and is not guaranteed to point to a Kubernetes APIServer.
-	RESTClient func(cmd *cobra.Command, mapping *meta.RESTMapping) (resource.RESTClient, error)
-	// Returns a Describer for displaying the specified RESTMapping type or an error.
-	Describer func(cmd *cobra.Command, mapping *meta.RESTMapping) (kubectl.Describer, error)
-	// Returns a Printer for formatting objects of the given type or an error.
-	Printer func(cmd *cobra.Command, mapping *meta.RESTMapping, noHeaders bool) (kubectl.ResourcePrinter, error)
-	// Returns a Resizer for changing the size of the specified RESTMapping type or an error
-	Resizer func(cmd *cobra.Command, mapping *meta.RESTMapping) (kubectl.Resizer, error)
-	// Returns a Reaper for gracefully shutting down resources.
-	Reaper func(cmd *cobra.Command, mapping *meta.RESTMapping) (kubectl.Reaper, error)
-	// Returns a schema that can validate objects stored on disk.
-	Validator func(*cobra.Command) (validation.Schema, error)
-	// Returns the default namespace to use in cases where no other namespace is specified
-	DefaultNamespace func(cmd *cobra.Command) (string, error)
+// NewDefaultKubectlCommand creates the `kubectl` command with default arguments
+func NewDefaultKubectlCommand() *cobra.Command {
+	return NewDefaultKubectlCommandWithArgs(&defaultPluginHandler{}, os.Args, os.Stdin, os.Stdout, os.Stderr)
 }
 
-// NewFactory creates a factory with the default Kubernetes resources defined
-// if optionalClientConfig is nil, then flags will be bound to a new clientcmd.ClientConfig.
-// if optionalClientConfig is not nil, then this factory will make use of it.
-func NewFactory(optionalClientConfig clientcmd.ClientConfig) *Factory {
-	mapper := kubectl.ShortcutExpander{latest.RESTMapper}
+// NewDefaultKubectlCommandWithArgs creates the `kubectl` command with arguments
+func NewDefaultKubectlCommandWithArgs(pluginHandler PluginHandler, args []string, in io.Reader, out, errout io.Writer) *cobra.Command {
+	cmd := NewKubectlCommand(in, out, errout)
 
-	flags := pflag.NewFlagSet("", pflag.ContinueOnError)
-
-	clientConfig := optionalClientConfig
-	if optionalClientConfig == nil {
-		clientConfig = DefaultClientConfig(flags)
+	if pluginHandler == nil {
+		return cmd
 	}
 
-	clients := &clientCache{
-		clients: make(map[string]*client.Client),
-		loader:  clientConfig,
+	if len(args) > 1 {
+		cmdPathPieces := args[1:]
+
+		// only look for suitable extension executables if
+		// the specified command does not already exist
+		if _, _, err := cmd.Find(cmdPathPieces); err != nil {
+			if err := handleEndpointExtensions(pluginHandler, cmdPathPieces); err != nil {
+				fmt.Fprintf(errout, "%v\n", err)
+				os.Exit(1)
+			}
+		}
 	}
 
-	return &Factory{
-		clients: clients,
-		flags:   flags,
-
-		Object: func(cmd *cobra.Command) (meta.RESTMapper, runtime.ObjectTyper) {
-			cfg, err := clientConfig.ClientConfig()
-			cmdutil.CheckErr(err)
-			cmdApiVersion := cfg.Version
-
-			return kubectl.OutputVersionMapper{mapper, cmdApiVersion}, api.Scheme
-		},
-		Client: func(cmd *cobra.Command) (*client.Client, error) {
-			return clients.ClientForVersion("")
-		},
-		ClientConfig: func(cmd *cobra.Command) (*client.Config, error) {
-			return clients.ClientConfigForVersion("")
-		},
-		RESTClient: func(cmd *cobra.Command, mapping *meta.RESTMapping) (resource.RESTClient, error) {
-			client, err := clients.ClientForVersion(mapping.APIVersion)
-			if err != nil {
-				return nil, err
-			}
-			return client.RESTClient, nil
-		},
-		Describer: func(cmd *cobra.Command, mapping *meta.RESTMapping) (kubectl.Describer, error) {
-			client, err := clients.ClientForVersion(mapping.APIVersion)
-			if err != nil {
-				return nil, err
-			}
-			describer, ok := kubectl.DescriberFor(mapping.Kind, client)
-			if !ok {
-				return nil, fmt.Errorf("no description has been implemented for %q", mapping.Kind)
-			}
-			return describer, nil
-		},
-		Printer: func(cmd *cobra.Command, mapping *meta.RESTMapping, noHeaders bool) (kubectl.ResourcePrinter, error) {
-			return kubectl.NewHumanReadablePrinter(noHeaders), nil
-		},
-		Resizer: func(cmd *cobra.Command, mapping *meta.RESTMapping) (kubectl.Resizer, error) {
-			client, err := clients.ClientForVersion(mapping.APIVersion)
-			if err != nil {
-				return nil, err
-			}
-			return kubectl.ResizerFor(mapping.Kind, client)
-		},
-		Reaper: func(cmd *cobra.Command, mapping *meta.RESTMapping) (kubectl.Reaper, error) {
-			client, err := clients.ClientForVersion(mapping.APIVersion)
-			if err != nil {
-				return nil, err
-			}
-			return kubectl.ReaperFor(mapping.Kind, client)
-		},
-		Validator: func(cmd *cobra.Command) (validation.Schema, error) {
-			if cmdutil.GetFlagBool(cmd, "validate") {
-				client, err := clients.ClientForVersion("")
-				if err != nil {
-					return nil, err
-				}
-				return &clientSwaggerSchema{client, api.Scheme}, nil
-			}
-			return validation.NullSchema{}, nil
-		},
-		DefaultNamespace: func(cmd *cobra.Command) (string, error) {
-			return clientConfig.Namespace()
-		},
-	}
+	return cmd
 }
 
-// BindFlags adds any flags that are common to all kubectl sub commands.
-func (f *Factory) BindFlags(flags *pflag.FlagSet) {
-	// any flags defined by external projects (not part of pflags)
-	util.AddAllFlagsToPFlagSet(flags)
+// PluginHandler is capable of parsing command line arguments
+// and performing executable filename lookups to search
+// for valid plugin files, and execute found plugins.
+type PluginHandler interface {
+	// Lookup receives a potential filename and returns
+	// a full or relative path to an executable, if one
+	// exists at the given filename, or an error.
+	Lookup(filename string) (string, error)
+	// Execute receives an executable's filepath, a slice
+	// of arguments, and a slice of environment variables
+	// to relay to the executable.
+	Execute(executablePath string, cmdArgs, environment []string) error
+}
 
-	// This is necessary as github.com/spf13/cobra doesn't support "global"
-	// pflags currently.  See https://github.com/spf13/cobra/issues/44.
-	util.AddPFlagSetToPFlagSet(pflag.CommandLine, flags)
+type defaultPluginHandler struct{}
 
-	if f.flags != nil {
-		f.flags.VisitAll(func(flag *pflag.Flag) {
-			flags.AddFlag(flag)
-		})
+// Lookup implements PluginHandler
+func (h *defaultPluginHandler) Lookup(filename string) (string, error) {
+	// if on Windows, append the "exe" extension
+	// to the filename that we are looking up.
+	if runtime.GOOS == "windows" {
+		filename = filename + ".exe"
 	}
 
-	// Globally persistent flags across all subcommands.
-	// TODO Change flag names to consts to allow safer lookup from subcommands.
-	// TODO Add a verbose flag that turns on glog logging. Probably need a way
-	// to do that automatically for every subcommand.
-	flags.BoolVar(&f.clients.matchVersion, FlagMatchBinaryVersion, false, "Require server version to match client version")
-	flags.Bool("validate", false, "If true, use a schema to validate the input before sending it")
+	return exec.LookPath(filename)
+}
+
+// Execute implements PluginHandler
+func (h *defaultPluginHandler) Execute(executablePath string, cmdArgs, environment []string) error {
+	return syscall.Exec(executablePath, cmdArgs, environment)
+}
+
+func handleEndpointExtensions(pluginHandler PluginHandler, cmdArgs []string) error {
+	remainingArgs := []string{} // all "non-flag" arguments
+
+	for idx := range cmdArgs {
+		if strings.HasPrefix(cmdArgs[idx], "-") {
+			break
+		}
+		remainingArgs = append(remainingArgs, strings.Replace(cmdArgs[idx], "-", "_", -1))
+	}
+
+	foundBinaryPath := ""
+
+	// attempt to find binary, starting at longest possible name with given cmdArgs
+	for len(remainingArgs) > 0 {
+		path, err := pluginHandler.Lookup(fmt.Sprintf("kubectl-%s", strings.Join(remainingArgs, "-")))
+		if err != nil || len(path) == 0 {
+			remainingArgs = remainingArgs[:len(remainingArgs)-1]
+			continue
+		}
+
+		foundBinaryPath = path
+		break
+	}
+
+	if len(foundBinaryPath) == 0 {
+		return nil
+	}
+
+	// invoke cmd binary relaying the current environment and args given
+	// remainingArgs will always have at least one element.
+	// execve will make remainingArgs[0] the "binary name".
+	if err := pluginHandler.Execute(foundBinaryPath, append([]string{foundBinaryPath}, cmdArgs[len(remainingArgs):]...), os.Environ()); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // NewKubectlCommand creates the `kubectl` command and its nested children.
-func (f *Factory) NewKubectlCommand(in io.Reader, out, err io.Writer) *cobra.Command {
+func NewKubectlCommand(in io.Reader, out, err io.Writer) *cobra.Command {
 	// Parent command to which all subcommands are added.
 	cmds := &cobra.Command{
 		Use:   "kubectl",
-		Short: "kubectl controls the Kubernetes cluster manager",
-		Long: `kubectl controls the Kubernetes cluster manager.
+		Short: i18n.T("kubectl controls the Kubernetes cluster manager"),
+		Long: templates.LongDesc(`
+      kubectl controls the Kubernetes cluster manager.
 
-Find more information at https://github.com/GoogleCloudPlatform/kubernetes.`,
+      Find more information at:
+            https://kubernetes.io/docs/reference/kubectl/overview/`),
 		Run: runHelp,
+		// Hook before and after Run initialize and write profiles to disk,
+		// respectively.
+		PersistentPreRunE: func(*cobra.Command, []string) error {
+			return initProfiling()
+		},
+		PersistentPostRunE: func(*cobra.Command, []string) error {
+			return flushProfiling()
+		},
+		BashCompletionFunction: bashCompletionFunc,
 	}
 
-	f.BindFlags(cmds.PersistentFlags())
+	flags := cmds.PersistentFlags()
+	flags.SetNormalizeFunc(utilflag.WarnWordSepNormalizeFunc) // Warn for "_" flags
 
-	cmds.AddCommand(f.NewCmdVersion(out))
-	cmds.AddCommand(f.NewCmdClusterInfo(out))
-	cmds.AddCommand(f.NewCmdProxy(out))
+	// Normalize all flags that are coming from other packages or pre-configurations
+	// a.k.a. change all "_" to "-". e.g. glog package
+	flags.SetNormalizeFunc(utilflag.WordSepNormalizeFunc)
 
-	cmds.AddCommand(f.NewCmdGet(out))
-	cmds.AddCommand(f.NewCmdDescribe(out))
-	cmds.AddCommand(f.NewCmdCreate(out))
-	cmds.AddCommand(f.NewCmdUpdate(out))
-	cmds.AddCommand(f.NewCmdDelete(out))
+	addProfilingFlags(flags)
 
-	cmds.AddCommand(cmdconfig.NewCmdConfig(out))
-	cmds.AddCommand(NewCmdNamespace(out))
-	cmds.AddCommand(f.NewCmdLog(out))
-	cmds.AddCommand(f.NewCmdRollingUpdate(out))
-	cmds.AddCommand(f.NewCmdResize(out))
+	kubeConfigFlags := genericclioptions.NewConfigFlags()
+	kubeConfigFlags.AddFlags(flags)
+	matchVersionKubeConfigFlags := cmdutil.NewMatchVersionFlags(kubeConfigFlags)
+	matchVersionKubeConfigFlags.AddFlags(cmds.PersistentFlags())
 
-	cmds.AddCommand(f.NewCmdExec(in, out, err))
-	cmds.AddCommand(f.NewCmdPortForward())
+	cmds.PersistentFlags().AddGoFlagSet(flag.CommandLine)
 
-	cmds.AddCommand(f.NewCmdRunContainer(out))
-	cmds.AddCommand(f.NewCmdStop(out))
-	cmds.AddCommand(f.NewCmdExposeService(out))
+	f := cmdutil.NewFactory(matchVersionKubeConfigFlags)
 
-	cmds.AddCommand(f.NewCmdLabel(out))
+	// Sending in 'nil' for the getLanguageFn() results in using
+	// the LANG environment variable.
+	//
+	// TODO: Consider adding a flag or file preference for setting
+	// the language, instead of just loading from the LANG env. variable.
+	i18n.LoadTranslations("kubectl", nil)
+
+	// From this point and forward we get warnings on flags that contain "_" separators
+	cmds.SetGlobalNormalizationFunc(utilflag.WarnWordSepNormalizeFunc)
+
+	ioStreams := genericclioptions.IOStreams{In: in, Out: out, ErrOut: err}
+
+	groups := templates.CommandGroups{
+		{
+			Message: "Basic Commands (Beginner):",
+			Commands: []*cobra.Command{
+				create.NewCmdCreate(f, ioStreams),
+				expose.NewCmdExposeService(f, ioStreams),
+				run.NewCmdRun(f, ioStreams),
+				set.NewCmdSet(f, ioStreams),
+			},
+		},
+		{
+			Message: "Basic Commands (Intermediate):",
+			Commands: []*cobra.Command{
+				explain.NewCmdExplain("kubectl", f, ioStreams),
+				get.NewCmdGet("kubectl", f, ioStreams),
+				edit.NewCmdEdit(f, ioStreams),
+				delete.NewCmdDelete(f, ioStreams),
+			},
+		},
+		{
+			Message: "Deploy Commands:",
+			Commands: []*cobra.Command{
+				rollout.NewCmdRollout(f, ioStreams),
+				rollingupdate.NewCmdRollingUpdate(f, ioStreams),
+				scale.NewCmdScale(f, ioStreams),
+				autoscale.NewCmdAutoscale(f, ioStreams),
+			},
+		},
+		{
+			Message: "Cluster Management Commands:",
+			Commands: []*cobra.Command{
+				certificates.NewCmdCertificate(f, ioStreams),
+				clusterinfo.NewCmdClusterInfo(f, ioStreams),
+				top.NewCmdTop(f, ioStreams),
+				drain.NewCmdCordon(f, ioStreams),
+				drain.NewCmdUncordon(f, ioStreams),
+				drain.NewCmdDrain(f, ioStreams),
+				taint.NewCmdTaint(f, ioStreams),
+			},
+		},
+		{
+			Message: "Troubleshooting and Debugging Commands:",
+			Commands: []*cobra.Command{
+				describe.NewCmdDescribe("kubectl", f, ioStreams),
+				logs.NewCmdLogs(f, ioStreams),
+				attach.NewCmdAttach(f, ioStreams),
+				cmdexec.NewCmdExec(f, ioStreams),
+				portforward.NewCmdPortForward(f, ioStreams),
+				proxy.NewCmdProxy(f, ioStreams),
+				cp.NewCmdCp(f, ioStreams),
+				auth.NewCmdAuth(f, ioStreams),
+			},
+		},
+		{
+			Message: "Advanced Commands:",
+			Commands: []*cobra.Command{
+				diff.NewCmdDiff(f, ioStreams),
+				apply.NewCmdApply("kubectl", f, ioStreams),
+				patch.NewCmdPatch(f, ioStreams),
+				replace.NewCmdReplace(f, ioStreams),
+				wait.NewCmdWait(f, ioStreams),
+				convert.NewCmdConvert(f, ioStreams),
+			},
+		},
+		{
+			Message: "Settings Commands:",
+			Commands: []*cobra.Command{
+				label.NewCmdLabel(f, ioStreams),
+				annotate.NewCmdAnnotate("kubectl", f, ioStreams),
+				completion.NewCmdCompletion(ioStreams.Out, ""),
+			},
+		},
+	}
+	groups.Add(cmds)
+
+	filters := []string{"options"}
+
+	// Hide the "alpha" subcommand if there are no alpha commands in this build.
+	alpha := NewCmdAlpha(f, ioStreams)
+	if !alpha.HasSubCommands() {
+		filters = append(filters, alpha.Name())
+	}
+
+	templates.ActsAsRootCommand(cmds, filters, groups...)
+
+	for name, completion := range bashCompletionFlags {
+		if cmds.Flag(name) != nil {
+			if cmds.Flag(name).Annotations == nil {
+				cmds.Flag(name).Annotations = map[string][]string{}
+			}
+			cmds.Flag(name).Annotations[cobra.BashCompCustom] = append(
+				cmds.Flag(name).Annotations[cobra.BashCompCustom],
+				completion,
+			)
+		}
+	}
+
+	cmds.AddCommand(alpha)
+	cmds.AddCommand(cmdconfig.NewCmdConfig(f, clientcmd.NewDefaultPathOptions(), ioStreams))
+	cmds.AddCommand(plugin.NewCmdPlugin(f, ioStreams))
+	cmds.AddCommand(version.NewCmdVersion(f, ioStreams))
+	cmds.AddCommand(apiresources.NewCmdAPIVersions(f, ioStreams))
+	cmds.AddCommand(apiresources.NewCmdAPIResources(f, ioStreams))
+	cmds.AddCommand(options.NewCmdOptions(ioStreams.Out))
 
 	return cmds
-}
-
-// PrintObject prints an api object given command line flags to modify the output format
-func (f *Factory) PrintObject(cmd *cobra.Command, obj runtime.Object, out io.Writer) error {
-	mapper, _ := f.Object(cmd)
-	_, kind, err := api.Scheme.ObjectVersionAndKind(obj)
-	if err != nil {
-		return err
-	}
-
-	mapping, err := mapper.RESTMapping(kind)
-	if err != nil {
-		return err
-	}
-
-	printer, err := f.PrinterForMapping(cmd, mapping)
-	if err != nil {
-		return err
-	}
-	return printer.PrintObj(obj, out)
-}
-
-// PrinterForMapping returns a printer suitable for displaying the provided resource type.
-// Requires that printer flags have been added to cmd (see AddPrinterFlags).
-func (f *Factory) PrinterForMapping(cmd *cobra.Command, mapping *meta.RESTMapping) (kubectl.ResourcePrinter, error) {
-	printer, ok, err := cmdutil.PrinterForCommand(cmd)
-	if err != nil {
-		return nil, err
-	}
-	if ok {
-		clientConfig, err := f.ClientConfig(cmd)
-		if err != nil {
-			return nil, err
-		}
-		defaultVersion := clientConfig.Version
-
-		version := cmdutil.OutputVersion(cmd, defaultVersion)
-		if len(version) == 0 {
-			version = mapping.APIVersion
-		}
-		if len(version) == 0 {
-			return nil, fmt.Errorf("you must specify an output-version when using this output format")
-		}
-		printer = kubectl.NewVersionedPrinter(printer, mapping.ObjectConvertor, version)
-	} else {
-		printer, err = f.Printer(cmd, mapping, cmdutil.GetFlagBool(cmd, "no-headers"))
-		if err != nil {
-			return nil, err
-		}
-	}
-	return printer, nil
-}
-
-// ClientMapperForCommand returns a ClientMapper for the given command and factory.
-func (f *Factory) ClientMapperForCommand(cmd *cobra.Command) resource.ClientMapper {
-	return resource.ClientMapperFunc(func(mapping *meta.RESTMapping) (resource.RESTClient, error) {
-		return f.RESTClient(cmd, mapping)
-	})
-}
-
-// DefaultClientConfig creates a clientcmd.ClientConfig with the following hierarchy:
-//   1.  Use the kubeconfig builder.  The number of merges and overrides here gets a little crazy.  Stay with me.
-//       1.  Merge together the kubeconfig itself.  This is done with the following hierarchy and merge rules:
-//           1.  CommandLineLocation - this parsed from the command line, so it must be late bound
-//           2.  EnvVarLocation
-//           3.  CurrentDirectoryLocation
-//           4.  HomeDirectoryLocation
-//           Empty filenames are ignored.  Files with non-deserializable content produced errors.
-//           The first file to set a particular value or map key wins and the value or map key is never changed.
-//           This means that the first file to set CurrentContext will have its context preserved.  It also means
-//           that if two files specify a "red-user", only values from the first file's red-user are used.  Even
-//           non-conflicting entries from the second file's "red-user" are discarded.
-//       2.  Determine the context to use based on the first hit in this chain
-//           1.  command line argument - again, parsed from the command line, so it must be late bound
-//           2.  CurrentContext from the merged kubeconfig file
-//           3.  Empty is allowed at this stage
-//       3.  Determine the cluster info and auth info to use.  At this point, we may or may not have a context.  They
-//           are built based on the first hit in this chain.  (run it twice, once for auth, once for cluster)
-//           1.  command line argument
-//           2.  If context is present, then use the context value
-//           3.  Empty is allowed
-//       4.  Determine the actual cluster info to use.  At this point, we may or may not have a cluster info.  Build
-//           each piece of the cluster info based on the chain:
-//           1.  command line argument
-//           2.  If cluster info is present and a value for the attribute is present, use it.
-//           3.  If you don't have a server location, bail.
-//       5.  Auth info is build using the same rules as cluster info, EXCEPT that you can only have one authentication
-//           technique per auth info.  The following conditions result in an error:
-//           1.  If there are two conflicting techniques specified from the command line, fail.
-//           2.  If the command line does not specify one, and the auth info has conflicting techniques, fail.
-//           3.  If the command line specifies one and the auth info specifies another, honor the command line technique.
-//   2.  Use default values and potentially prompt for auth information
-func DefaultClientConfig(flags *pflag.FlagSet) clientcmd.ClientConfig {
-	loadingRules := clientcmd.NewClientConfigLoadingRules()
-	loadingRules.EnvVarPath = os.Getenv(clientcmd.RecommendedConfigPathEnvVar)
-	flags.StringVar(&loadingRules.CommandLinePath, "kubeconfig", "", "Path to the kubeconfig file to use for CLI requests.")
-
-	overrides := &clientcmd.ConfigOverrides{}
-	flagNames := clientcmd.RecommendedConfigOverrideFlags("")
-	// short flagnames are disabled by default.  These are here for compatibility with existing scripts
-	flagNames.AuthOverrideFlags.AuthPathShort = "a"
-	flagNames.ClusterOverrideFlags.APIServerShort = "s"
-
-	clientcmd.BindOverrideFlags(overrides, flags, flagNames)
-	clientConfig := clientcmd.NewInteractiveDeferredLoadingClientConfig(loadingRules, overrides, os.Stdin)
-
-	return clientConfig
 }
 
 func runHelp(cmd *cobra.Command, args []string) {
 	cmd.Help()
 }
 
-type clientSwaggerSchema struct {
-	c *client.Client
-	t runtime.ObjectTyper
-}
+// deprecatedAlias is intended to be used to create a "wrapper" command around
+// an existing command. The wrapper works the same but prints a deprecation
+// message before running. This command is identical functionality.
+func deprecatedAlias(deprecatedVersion string, cmd *cobra.Command) *cobra.Command {
+	// Have to be careful here because Cobra automatically extracts the name
+	// of the command from the .Use field.
+	originalName := cmd.Name()
 
-func (c *clientSwaggerSchema) ValidateBytes(data []byte) error {
-	version, _, err := c.t.DataVersionAndKind(data)
-	if err != nil {
-		return err
-	}
-	schemaData, err := c.c.RESTClient.Get().
-		AbsPath("/swaggerapi/api", version).
-		Do().
-		Raw()
-	if err != nil {
-		return err
-	}
-	schema, err := validation.NewSwaggerSchemaFromBytes(schemaData)
-	if err != nil {
-		return err
-	}
-	return schema.ValidateBytes(data)
-}
-
-// clientCache caches previously loaded clients for reuse, and ensures MatchServerVersion
-// is invoked only once
-type clientCache struct {
-	loader        clientcmd.ClientConfig
-	clients       map[string]*client.Client
-	defaultConfig *client.Config
-	matchVersion  bool
-}
-
-// ClientConfigForVersion returns the correct config for a server
-func (c *clientCache) ClientConfigForVersion(version string) (*client.Config, error) {
-	if c.defaultConfig == nil {
-		config, err := c.loader.ClientConfig()
-		if err != nil {
-			return nil, err
-		}
-		c.defaultConfig = config
-		if c.matchVersion {
-			if err := client.MatchesServerVersion(config); err != nil {
-				return nil, err
-			}
-		}
-	}
-	// TODO: have a better config copy method
-	config := *c.defaultConfig
-	if len(version) != 0 {
-		config.Version = version
-	}
-	client.SetKubernetesDefaults(&config)
-
-	return &config, nil
-}
-
-// ClientForVersion initializes or reuses a client for the specified version, or returns an
-// error if that is not possible
-func (c *clientCache) ClientForVersion(version string) (*client.Client, error) {
-	config, err := c.ClientConfigForVersion(version)
-	if err != nil {
-		return nil, err
-	}
-
-	if client, ok := c.clients[config.Version]; ok {
-		return client, nil
-	}
-
-	client, err := client.New(config)
-	if err != nil {
-		return nil, err
-	}
-
-	c.clients[config.Version] = client
-	return client, nil
+	cmd.Use = deprecatedVersion
+	cmd.Deprecated = fmt.Sprintf("use %q instead", originalName)
+	cmd.Short = fmt.Sprintf("%s. This command is deprecated, use %q instead", cmd.Short, originalName)
+	cmd.Hidden = true
+	return cmd
 }

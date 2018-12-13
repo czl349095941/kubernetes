@@ -1,5 +1,5 @@
 /*
-Copyright 2014 Google Inc. All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,29 +22,26 @@ package main
 
 import (
 	"fmt"
+	"math/rand"
 	"os"
-	"runtime"
+	"time"
 
-	"github.com/GoogleCloudPlatform/kubernetes/cmd/kubelet/app"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/util"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/version/verflag"
-
-	"github.com/spf13/pflag"
+	"k8s.io/apiserver/pkg/server"
+	"k8s.io/apiserver/pkg/util/logs"
+	"k8s.io/kubernetes/cmd/kubelet/app"
+	_ "k8s.io/kubernetes/pkg/client/metrics/prometheus" // for client metric registration
+	_ "k8s.io/kubernetes/pkg/version/prometheus"        // for version metric registration
 )
 
 func main() {
-	runtime.GOMAXPROCS(runtime.NumCPU())
-	s := app.NewKubeletServer()
-	s.AddFlags(pflag.CommandLine)
+	rand.Seed(time.Now().UnixNano())
 
-	util.InitFlags()
-	util.InitLogs()
-	defer util.FlushLogs()
+	command := app.NewKubeletCommand(server.SetupSignalHandler())
+	logs.InitLogs()
+	defer logs.FlushLogs()
 
-	verflag.PrintAndExitIfRequested()
-
-	if err := s.Run(pflag.CommandLine.Args()); err != nil {
-		fmt.Fprint(os.Stderr, err.Error)
+	if err := command.Execute(); err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
 }

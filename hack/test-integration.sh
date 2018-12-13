@@ -1,6 +1,6 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Copyright 2014 Google Inc. All rights reserved.
+# Copyright 2016 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,36 +14,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# any command line arguments will be passed to hack/build_go.sh to build the
-# cmd/integration binary.  --use_go_build is a legitimate argument, as are
-# any other build time arguments.
+# This script is a vestigial redirection.  Please do not add "real" logic.
 
 set -o errexit
 set -o nounset
 set -o pipefail
 
 KUBE_ROOT=$(dirname "${BASH_SOURCE}")/..
-source "${KUBE_ROOT}/hack/lib/init.sh"
 
-cleanup() {
-  kube::etcd::cleanup
-  kube::log::status "Integration test cleanup complete"
-}
-
-"${KUBE_ROOT}/hack/build-go.sh" "$@" cmd/integration
-
-# Run cleanup to stop etcd on interrupt or other kill signal.
-trap cleanup EXIT
-
-kube::etcd::start
-
-kube::log::status "Running integration test cases"
-KUBE_GOFLAGS="-tags 'integration no-docker' " \
-  KUBE_RACE="-race" \
-  "${KUBE_ROOT}/hack/test-go.sh" test/integration
-
-kube::log::status "Running integration test scenario"
-
-"${KUBE_OUTPUT_HOSTBIN}/integration" --v=2
-
-cleanup
+echo "$0 has been replaced by 'make test-integration'"
+echo
+echo "The following invocation will run all integration tests: "
+echo '    make test-integration'
+echo
+echo "The following invocation will run a specific test with the verbose flag set: "
+echo '    make test-integration WHAT=./test/integration/pods GOFLAGS="-v" KUBE_TEST_ARGS="-run ^TestPodUpdateActiveDeadlineSeconds$"'
+echo
+exit 1
